@@ -1,0 +1,5 @@
+[2022-06-24 01:24:31,772][absl][INFO] - MUJOCO_GL is not set, so an OpenGL backend will be chosen automatically.
+[2022-06-24 01:24:31,774][absl][INFO] - Successfully imported OpenGL backend: glfw
+[2022-06-24 01:24:31,795][absl][INFO] - MuJoCo library version is: 215
+[2022-06-24 01:25:03,701][absl][INFO] - Unable to initialize backend 'tpu_driver': NOT_FOUND: Unable to find driver in registry given worker: 
+[2022-06-24 01:25:03,802][absl][INFO] - Unable to initialize backend 'tpu': INVALID_ARGUMENT: TpuPlatform is not available.
