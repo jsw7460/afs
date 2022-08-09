@@ -35,19 +35,32 @@ from offline_baselines_jax.common.type_aliases import (
 from offline_baselines_jax.common.utils import get_basic_rngs
 from offline_baselines_jax.common.utils import should_collect_more_steps
 from .buffer import HigherReplayBuffer, LowerReplayBuffer
-from .core import hrl_higher_policy_update, hrl_lower_policy_update
+from .core import hrl_higher_policy_update, hrl_lower_policy_update, discrete_hrl_lower_policy_update
 from .hrl_policies import ConditionedActor
-from .hrl_policies import HigherPolicy, LowerPolicy
+from .hrl_policies import HigherPolicy, LowerPolicy, DiscreteLowerPolicy
 from .networks import (
     MLPSkillPrior,
+    SquashedMLPSkillPrior,
     PseudoActionPolicy,
     DeterministicPseudoActionPolicy,
 )
 from .policies import SkillBasedComposedPolicy
 from .sopt_skill_prior import SOPTSkillEmpowered
-from .utils import clock
+from .utils import clock, get_linear_fn
 
 EPS = 1E-8
+
+
+def tree_leaves_equations(x, y):
+    l1 = np.array(jax.tree_leaves(x))
+    l2 = np.array(jax.tree_leaves(y))
+    assert len(l1) == len(l2)
+    for p1, p2 in zip(l1, l2):
+        z = np.mean(p1 == p2)
+        print(z)
+        if z < 1.0:
+            print(p1, p2)
+    return np.all(l1 == l2)
 
 
 def check_nested_dict_numpy_equation(x: Dict, y: Dict):
@@ -91,9 +104,9 @@ def forward_skill_prior(rng: jnp.ndarray, skill_prior: Model, observations: jnp.
 
 
 
-@partial(jax.jit, static_argnames=("batch_size", "n_rand", "skill_dim"))
-def sample_normal(rng: jnp.ndarray, *shape):
-    return jax.random.normal(rng, shape=shape)
+@partial(jax.jit, static_argnames=("batch_size", "a", "b", "c"))
+def sample_normal(rng: jnp.ndarray, a, b, c):
+    return jax.random.normal(rng, shape=(a, b, c))
 
 
 @partial(jax.jit)
@@ -118,7 +131,7 @@ def get_maxprob_indices(
     return max_indices
 
 
-@clock(fmt="[{name}: {elapsed: 0.8f}s]")
+# @clock(fmt="[{name}: {elapsed: 0.8f}s]")
 def offpolicy_correction(
     rng: jnp.ndarray,
     lower_policy: LowerPolicy,
@@ -136,8 +149,9 @@ def offpolicy_correction(
 
     _higher_actions = higher_actions[:, jnp.newaxis, ...]
     _higher_actions = jnp.repeat(_higher_actions, repeats=n_rand-1, axis=1)
+
     perturbed_skills \
-        = _higher_actions + skill_perturbing_std * sample_normal(sampling_key, (batch_size, n_rand-1, skill_dim))
+        = _higher_actions + skill_perturbing_std * sample_normal(sampling_key, batch_size, n_rand-1, skill_dim)
 
     # Include original higher action
     perturbed_skills = jnp.concatenate((perturbed_skills, higher_actions[:, jnp.newaxis, ...]), axis=1)      # [batch, n_rand, skill_dim]
@@ -180,12 +194,6 @@ def get_similarity_intrinsic_reward(
     similarity = jnp.dot(renormalized_pseudo_action, pred.T) \
                  / (jnp.linalg.norm(renormalized_pseudo_action) * jnp.linalg.norm(pred))
 
-    # _, _, cur_z_logstd = higher_actor.apply_fn(
-    #     {"params": higher_actor.params, "batch_stats": higher_actor.batch_stats},
-    #     representation,
-    #     deterministic=True
-    # )
-    # cur_z_var = jnp.exp(cur_z_logstd) ** 2
     _, _, next_z_logstd = higher_actor.apply_fn(
         {"params": higher_actor.params, "batch_stats": higher_actor.batch_stats},
         next_representation,
@@ -195,6 +203,61 @@ def get_similarity_intrinsic_reward(
     next_z_var = jnp.exp(next_z_logstd) ** 2
     # return 0.01 * (3 * similarity.mean() - z_var.mean()), (renormalized_pseudo_action, next_representation - representation), 0.0
     return 0.01 * (3 * similarity.mean() - next_z_var.mean())
+
+
+@partial(jax.jit, static_argnames=("deterministic", "pseudo_action_dim"))
+def get_dropout_intrinsic_reward(
+    rng: jnp.ndarray,
+    representation: jnp.ndarray,
+    next_representation: jnp.ndarray,
+    normalizing_max: jnp.ndarray,
+    normalizing_min: jnp.ndarray,
+    z: jnp.ndarray,
+    higher_actor: Model,
+    skill_prior: Model,
+    pseudo_action_policy: Model,
+    deterministic: bool = True,
+    pseudo_action_dim: int = None,
+    **_,
+):
+    rng, dropout_key = jax.random.split(rng)
+    pseudo_action = pseudo_action_policy.apply_fn(
+        {"params": pseudo_action_policy.params, "batch_stats": pseudo_action_policy.batch_stats},
+        representation,
+        z,
+        rngs={"dropout": dropout_key},
+        deterministic=deterministic,
+        training=False,
+        method=PseudoActionPolicy.get_deterministic_actions
+    )
+    # pseudo_action = pseudo_action_dist.sample(seed=rng)
+    renormalized_pseudo_action = (normalizing_max - normalizing_min + EPS) * (pseudo_action + 1) / 2 + normalizing_min
+    renormalized_pseudo_action = renormalized_pseudo_action[:, :pseudo_action_dim]
+    pred = (next_representation - representation)[:, :pseudo_action_dim]
+    # Compute similarity
+
+    similarity = jnp.dot(renormalized_pseudo_action, pred.T) \
+                 / (jnp.linalg.norm(renormalized_pseudo_action) * jnp.linalg.norm(pred))
+    batch_representations = jnp.repeat(next_representation, repeats=10, axis=0)
+
+    # [M, dim]
+    _, stochastic_forward_pass, _ = skill_prior.apply_fn(
+        {"params": skill_prior.params, "batch_stats": skill_prior.batch_stats},
+        batch_representations,
+        rngs = {"dropout": dropout_key},
+        deterministic=False,
+        training=False,
+    )
+
+    term_1 = np.sum(stochastic_forward_pass * stochastic_forward_pass, axis=1)
+    term_1 = np.mean(term_1, axis=0)
+    s_1 = np.mean(stochastic_forward_pass, axis=0)
+    s_2 = np.mean(stochastic_forward_pass, axis=0)
+    term_2 = np.sum(s_1 * s_2, axis=-1)
+    next_z_var = term_1 - term_2
+    # return 0.01 * (3 * similarity.mean() - z_var.mean()), (renormalized_pseudo_action, next_representation - representation), 0.0
+    # return 0.01 * (3 * similarity.mean() - 0.001 * next_z_var.mean()), next_z_var
+    return similarity * 0.1, next_z_var, similarity
 
 
 class LogEntropyCoef(nn.Module):
@@ -387,6 +450,10 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
         self.without_exploration = _without_exploration
 
     @property
+    def skill_prior_class(self):
+        return SquashedMLPSkillPrior
+
+    @property
     def save_lowlevel_episodes(self) -> bool:
         return True
 
@@ -488,6 +555,7 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
         self.rng, rngs = get_basic_rngs(self.rng)
         init_obs = self.higher_observation_space.sample()[np.newaxis, ...]
         skill_prior = Model.create(skill_prior_def, inputs=[rngs, init_obs])  # Skill prior is not trained
+        if load_dir[-1] != "/": load_dir += "/"
         skill_prior = skill_prior.load_dict(load_dir + f"skill_prior_{load_epoch}")  # Load param
         skill_prior = skill_prior.load_batch_stats(
             load_dir + f"skill_prior_batch_stats_{load_epoch}")  # Load batch stats (for batch normalization)
@@ -497,9 +565,12 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
     def load_pseudo_action_policy(self, pretrained_kwargs: Dict, load_dir: str, load_epoch: int):
         init_obs = self.higher_observation_space.sample()[np.newaxis, ...]
         init_z = jax.random.normal(self.rng, shape=(1, self.skill_dim))
+        # In skill prior training phase, pseudo action decoder is called the lowlevel policy.
+        # In HRL phase, it will be called the pseudo action decoder.
         pseudo_action_policy_def = PseudoActionPolicy(**pretrained_kwargs["lowlevel_policy"])
         self.rng, rngs = get_basic_rngs(self.rng)
         pseudo_action_policy = Model.create(pseudo_action_policy_def, inputs=[rngs, init_obs, init_z])  # Not optimized
+        if load_dir[-1] != "/": load_dir += "/"
         pseudo_action_policy = pseudo_action_policy.load_dict(load_dir + f"lowlevel_policy_{load_epoch}")
         pseudo_action_policy = pseudo_action_policy.load_batch_stats(
             load_dir + f"lowlevel_policy_batch_stats_{load_epoch}"
@@ -524,7 +595,9 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
         lower_policy_config = hrl_config["lower_policy_config"]
         self.build_lower_policy(lower_policy_config)
 
-        with open(hrl_config["config_dir"] + "config", "rb") as f:
+        dir_path = hrl_config["config_dir"]
+        if dir_path[-1] != "/": dir_path += "/"
+        with open(dir_path + "config", "rb") as f:
             pretrained_kwargs = pickle.load(f)      # Pretrained networks architecture, batch_stats, etc., are saved
         self.normalizing_max = pretrained_kwargs["normalizing_max"]     # Normalizing factor, used to define pseudo actions.
         self.normalizing_min = pretrained_kwargs["normalizing_min"]
@@ -560,7 +633,6 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
         for gradient_step in range(gradient_steps):
 
             higher_replay_data = self.higher_replay_buffer.sample(batch_size)
-            lower_replay_data = self.lower_replay_buffer.sample(batch_size)
 
             target_update_cond = ((self.num_timesteps % self.target_update_interval) == 0)
             if self.use_hiro_relabel:
@@ -576,7 +648,6 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
                     n_rand=10,
                 )
                 z = np.array(z)
-
             else: z = higher_replay_data.higher_actions
 
             self.rng, higher_new_models, higher_infos = hrl_higher_policy_update(
@@ -586,25 +657,28 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
                 critic=self.higher_policy.critic,
                 critic_target=self.higher_policy.critic_target,
                 log_alpha=self.higher_log_ent_coef,
-                skill_prior=self.skill_prior,
+                skill_prior=self.skill_prior,           # For regularization
 
                 observations=self.get_representation(higher_replay_data.observations[:, 0, ...]),
                 actions=z,
-                rewards=higher_replay_data.rewards,
+                rewards=higher_replay_data.rewards / self.subseq_len,                   # note: 내가 잠시 추가해보았다. Critic이 너무 쉽게 터져서.
                 next_observations=self.get_representation(higher_replay_data.next_observations),
                 dones=higher_replay_data.dones,
                 gamma=self.gamma,
                 target_alpha=self.higher_target_entropy,
                 tau=self.tau,
-                target_update_cond=target_update_cond,
-                alpha_update=self.higher_entropy_update,
+                target_update_cond=True,
+                alpha_update=True,
             )
+
             self.higher_policy.actor = higher_new_models["higher_actor"]
             self.higher_policy.critic = higher_new_models["higher_critic"]
             self.higher_policy.critic_target = higher_new_models["higher_critic_target"]
             self.higher_log_ent_coef = higher_new_models["higher_log_alpha"]
 
             for _ in range(4):
+                lower_replay_data = self.lower_replay_buffer.sample(batch_size)
+
                 self.rng, lower_new_models, lower_infos = hrl_lower_policy_update(
                     rng=self.rng,
                     actor=self.lower_policy.actor,
@@ -662,6 +736,10 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
     def calculate_intrinsic_reward(self, **kwargs):
         return get_similarity_intrinsic_reward(**kwargs)
 
+    def calculate_dropout_intrinsic_reward(self, **kwargs):
+        intr_reward, *infos = get_dropout_intrinsic_reward(**kwargs)
+        return intr_reward
+
     # @clock(fmt="[{name}: {elapsed: 0.8f}s]")
     def collect_rollouts(
         self,
@@ -692,17 +770,16 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
             # Select action randomly or according to policy
             # NOTE: new_higher_actions: If timestep % subseq_len == 0, then it is same with 'z'. Otherwise, None.
-            #    This triggers the higher replay buffer to save the transitions.
+            #   This triggers the higher replay buffer to save the transitions.
             actions, buffer_actions, z, new_higher_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
 
             # Rescale and perform action
             new_obs, extrinsic_rewards, dones, infos = env.step(actions)
-            extrinsic_rewards = extrinsic_rewards
 
             self.higher_actor_rewards += extrinsic_rewards
 
             # Sample intrinsic reward to train the lower level policy
-            intrinsic_rewards = self.calculate_intrinsic_reward(
+            intrinsic_rewards = self.calculate_dropout_intrinsic_reward(
                     rng=self.rng,
                     representation=self.get_representation(self.last_obs.copy()),
                     next_representation=self.get_representation(new_obs),
@@ -711,6 +788,7 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
                     z=self.higher_policy.last_z,
                     # z_var=self.higher_policy.last_z_var,
                     higher_actor=self.higher_policy.actor,
+                    skill_prior=self.skill_prior,
                     pseudo_action_policy=self.pseudo_action_policy,
                     deterministic=True,
                     training=False,
@@ -809,12 +887,19 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
                 timestep=self.num_timesteps
             )
             new_higher_action = z.copy()
-            self.higher_policy.last_z = new_higher_action
-
         else:
             z = self.higher_policy.last_z
             new_higher_action = None
+
         return z, new_higher_action
+
+    def sample_lower_action(self, observations: jnp.ndarray, conditions: jnp.ndarray):
+        ret = self.lower_policy.predict(
+            observations,
+            deterministic=False,
+            conditions=conditions
+        )
+        return ret
 
     def _sample_action(
         self,
@@ -824,22 +909,23 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
     ) -> Tuple[jnp.ndarray, ...]:
         z, new_higher_action = self.sample_higher_action(self.get_higher_observation(self.last_obs))
 
-        # # Select action randomly or according to policy
-        # if self.num_timesteps < learning_starts:
-        #     # unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
-        #     self.rng, _ = jax.random.split(self.rng)
-        #     z = jax.random.uniform(self.rng, z.shape, minval=-2.0, maxval=2.0)
-        #
-        # else:
-        #     # Note: when using continuous actions,
-        #     # we assume that the policy uses tanh to scale the action
-        #     # We use non-deterministic action in the case of SAC, for TD3, it does not matter
-        #     pass
+        # Select action randomly or according to policy
+        if self.num_timesteps < learning_starts:
+            # unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
+            self.rng, _ = jax.random.split(self.rng)
+            # z = jax.random.uniform(self.rng, z.shape, minval=-2.0, maxval=2.0)
+            z = np.random.uniform(-2.0, 2.0, z.shape)
+            self.higher_policy.last_z = np.array(z)
 
-        unscaled_action = self.lower_policy.predict(
-            self.get_lower_observation(self.last_obs),
-            deterministic=False,
-            conditions=z
+        else:
+            # Note: when using continuous actions,
+            # we assume that the policy uses tanh to scale the action
+            # We use non-deterministic action in the case of SAC, for TD3, it does not matter
+            pass
+
+        unscaled_action = self.sample_lower_action(
+            observations=self.get_lower_observation(self.last_obs),
+            conditions=z,
         )
 
         # Rescale the action from [low, high] to [-1, 1]
@@ -960,6 +1046,35 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
             reset_num_timesteps=reset_num_timesteps,
         )
 
+    def predict(
+        self,
+        observation: np.ndarray,
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+        **kwargs,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        cur_timestep = kwargs.get("cur_timestep")
+        assert cur_timestep is not None
+        if cur_timestep % self.subseq_len == 0:
+            z = self.higher_policy.predict(
+                observations=observation,
+                deterministic=True,         # Not dropout, ...
+                register=False,
+                without_sampling=True,      # Not sampled action. Deterministic action.
+            )
+        else:
+            z = kwargs.get("last_z", None)
+
+        assert z is not None, "Invalid skill z"
+        actions = self.lower_policy.predict(
+            observations=observation,
+            conditions=z,
+            deterministic=True,
+            without_sampling=True
+        )
+        return actions, z
+
     def _excluded_save_params(self) -> List[str]:
         return super(SkillBasedHRLAgent, self)._excluded_save_params() \
                + ["actor", "critic", "critic_target", "log_ent_coef"]
@@ -969,3 +1084,134 @@ class SkillBasedHRLAgent(SOPTSkillEmpowered):
 
     def _get_jax_load_params(self) -> List[str]:
         return ['actor', 'critic', 'critic_target', 'log_ent_coef']
+
+
+class DiscreteSkillBasedHRLAgent(SkillBasedHRLAgent):
+    def __init__(self, *args, **kwargs):
+        super(DiscreteSkillBasedHRLAgent, self).__init__(*args, **kwargs)
+        self.lower_target_update_interval = 10000
+        self.exploration_initial_eps = 1.0
+        self.exploration_final_eps = 0.05
+        self.exploration_fraction = 0.1
+        self.exploration_schedule = get_linear_fn(
+            self.exploration_initial_eps,
+            self.exploration_final_eps,
+            self.exploration_fraction
+        )
+        self.exploration_rate = 0.0
+
+    def build_lower_policy(self, lower_policy_config: Dict) -> None:
+        self.lower_policy = DiscreteLowerPolicy(
+            rng=self.rng,
+            observation_space=self.lower_observation_space,
+            action_space=self.action_space,  # Target environment's action space
+            conditioned_dim=self.skill_dim,
+            lr_schedule=self.lr_schedule,
+            net_arch=lower_policy_config["net_arch"],
+            features_extractor_class=FlattenExtractor,
+            n_critics=lower_policy_config["n_critics"],
+            dropout=self.dropout
+        )
+        self.lower_policy.build_model(lower_policy_config)
+
+    def _on_step(self) -> None:
+        self.exploration_rate = self.exploration_schedule(self._current_progress_remaining)
+
+    def hrl_train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        higher_alpha_losses, higher_alphas = [], []
+        higher_actor_losses, higher_critic_losses = [], []
+        higher_prior_divergences = []
+
+        lower_critic_losses = []
+
+        for gradient_step in range(gradient_steps):
+
+            higher_replay_data = self.higher_replay_buffer.sample(batch_size)
+            lower_replay_data = self.lower_replay_buffer.sample(batch_size)
+
+            target_update_cond = ((self.num_timesteps % self.target_update_interval) == 0)
+            if self.use_hiro_relabel:
+                z = offpolicy_correction(
+                    rng=self.rng,
+                    lower_policy=self.lower_policy,
+                    observations=higher_replay_data.observations,
+                    lower_actions=higher_replay_data.lower_actions,
+                    higher_actions=higher_replay_data.higher_actions,
+                    skill_perturbing_std=0.1,
+                    batch_size=batch_size,
+                    skill_dim=self.skill_dim,
+                    n_rand=10,
+                )
+
+            else:
+                z = higher_replay_data.higher_actions
+
+            for _ in range(1):
+                self.rng, higher_new_models, higher_infos = hrl_higher_policy_update(
+                    rng=self.rng,
+
+                    actor=self.higher_policy.actor,
+                    critic=self.higher_policy.critic,
+                    critic_target=self.higher_policy.critic_target,
+                    log_alpha=self.higher_log_ent_coef,
+                    skill_prior=self.skill_prior,
+
+                    observations=self.get_representation(higher_replay_data.observations[:, 0, ...]),
+                    actions=z,
+                    rewards=higher_replay_data.rewards,
+                    next_observations=self.get_representation(higher_replay_data.next_observations),
+                    dones=higher_replay_data.dones,
+                    gamma=self.gamma,
+                    target_alpha=self.higher_target_entropy,
+                    tau=self.tau,
+                    target_update_cond=target_update_cond,
+                    alpha_update=self.higher_entropy_update,
+                )
+                self.higher_policy.actor = higher_new_models["higher_actor"]
+                self.higher_policy.critic = higher_new_models["higher_critic"]
+                self.higher_policy.critic_target = higher_new_models["higher_critic_target"]
+                self.higher_log_ent_coef = higher_new_models["higher_log_alpha"]
+
+            for _ in range(4):
+                lower_target_update_cond = ((self.num_timesteps % self.lower_target_update_interval) == 0)
+                self.rng, lower_new_models, lower_infos = discrete_hrl_lower_policy_update(
+                    rng=self.rng,
+                    critic=self.lower_policy.critic,
+                    critic_target=self.lower_policy.critic_target,
+
+                    observations=self.get_representation(lower_replay_data.observations),
+                    actions=lower_replay_data.actions,
+                    rewards=lower_replay_data.rewards,
+                    next_observations=self.get_representation(lower_replay_data.next_observations),
+                    dones=lower_replay_data.dones,
+                    conditions=lower_replay_data.higher_actions,
+                    next_conditions=lower_replay_data.next_higher_actions,
+
+                    gamma=self.gamma,
+                    target_update_cond=lower_target_update_cond
+                )
+                self.lower_policy.critic = lower_new_models["critic"]
+                self.lower_policy.critic_target = lower_new_models["critic_target"]
+                lower_critic_losses.append(lower_infos["critic_loss"].mean())
+
+            higher_actor_losses.append(higher_infos["higher_actor_loss"].mean())
+            higher_prior_divergences.append(higher_infos["prior_divergence"].mean())
+            higher_critic_losses.append(higher_infos["higher_critic_loss"].mean())
+            higher_alphas.append(higher_infos["higher_alpha"].mean())
+            higher_alpha_losses.append(higher_infos["higher_alpha_loss"].mean())
+
+        if self.num_timesteps % 100 == 0:
+            self.logger.record_mean("higher/actor_loss(h)", np.mean(higher_actor_losses))
+            self.logger.record_mean("higher/prior_div(h)", np.mean(higher_prior_divergences))
+            self.logger.record_mean("higher/critic_loss(h)", np.mean(higher_critic_losses))
+            self.logger.record_mean("higher/alpha_loss(h)", np.mean(higher_alpha_losses))
+            self.logger.record_mean("higher/alpha(h)", np.mean(higher_alphas))
+
+            self.logger.record_mean("lower/critic_loss(l)", np.mean(lower_critic_losses))
+            self.logger.record_mean("exploration/rate", self.exploration_rate)
+
+    def sample_lower_action(self, observations: jnp.ndarray, conditions: jnp.ndarray):
+        if np.random.rand() < self.exploration_rate:
+            return np.array(self.action_space.sample())[np.newaxis, ...]
+        else:
+            return super(DiscreteSkillBasedHRLAgent, self).sample_lower_action(observations, conditions)

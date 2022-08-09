@@ -286,7 +286,6 @@ class ImgBasedSkillPrior(SOPTSkillEmpowered):
             dtype=np.float32
         )
         self.img_embed_dim = cfg["sqrt_feature_dim"] ** 2
-
         return require_encoder_train, encoder_kwargs
 
     def build_skill_prior_models(self, skill_prior_config: Dict) -> Tuple[bool, int]:

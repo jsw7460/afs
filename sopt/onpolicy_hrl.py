@@ -68,6 +68,7 @@ class OnpolicySkillBasedHRLAgent(SkillBasedHRLAgent):
             higher_action_space=self.higher_action_space,
             lower_action_space=self.lower_action_space,
         )
+
     def build_higher_policy(self, higher_policy_config: Dict) -> None:
         super(OnpolicySkillBasedHRLAgent, self).build_higher_policy(higher_policy_config)
         del self.higher_policy.critic, self.higher_policy.critic_target
@@ -124,8 +125,7 @@ class OnpolicySkillBasedHRLAgent(SkillBasedHRLAgent):
             self.logger.record_mean("lower/alpha_loss(l)", np.mean(lower_alpha_losses))
             self.logger.record_mean("lower/alpha(l)", np.mean(lower_alphas))
 
-    def postprocess_episode_done(self):
-        print("Enter the episode done callback")
+    def postprocess_episode_done(self) -> None:
         """Train higher policy"""
         n_collected_transitions = self.higher_replay_buffer.pos
         replay_buffer = self.higher_replay_buffer.sample(batch_size=n_collected_transitions)
@@ -153,6 +153,11 @@ class OnpolicySkillBasedHRLAgent(SkillBasedHRLAgent):
 
         relabeled_returns = (relabeled_returns - relabeled_returns.mean()) / (relabeled_returns.std() + 1e-8)
 
+        actor_log_probs, prior_log_probs = [], []
+        ratios = []
+        actor_losses = []
+        clipped_fractions = []
+
         for _ in range(self.n_epoch):
             # Subtract baseline
             self.rng, new_models, infos = hrl_higher_policy_onpolicy_update(
@@ -167,8 +172,16 @@ class OnpolicySkillBasedHRLAgent(SkillBasedHRLAgent):
             self.higher_policy.actor = self.higher_policy.actor.replace(params=new_models["higher_actor"].params)
             # self.higher_policy.actor = new_models["higher_actor"]
 
-            print("="*30)
-            for k, v in infos.items():
-                print(k, v)
+            actor_log_probs.append(infos["actor_log_prob"])
+            prior_log_probs.append(infos["prior_log_prob"])
+            ratios.append(infos["ratio"])
+            actor_losses.append(infos["higher_actor_loss"])
+            clipped_fractions.append(infos["clip_fraction"])
+
+        self.logger.record_mean("higher/actor_loss(h)", np.mean(actor_losses))
+        self.logger.record_mean("higher/log_prob(h)", np.mean(actor_log_probs))
+        self.logger.record_mean("higher/prior_log_prob(h)", np.mean(prior_log_probs))
+        self.logger.record_mean("higher/ratio(h)", np.mean(ratios))
+        self.logger.record_mean("higher/clipped_frac(h)", np.mean(clipped_fractions))
 
         self.higher_replay_buffer.reset()

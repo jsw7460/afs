@@ -18,6 +18,7 @@ from .core_comp import (
     skill_generator_update,
     lowlevel_policy_update,
     learned_skill_prior_update,
+    learned_skill_prior_update_wobn,
     deterministic_lowlevel_policy_update,
     skill_generator_det_low_update,
 
@@ -31,10 +32,13 @@ from .core_comp import (
     hrl_lower_actor_update,
     hrl_lower_critic_update,
     hrl_lower_log_alpha_update,
+    hrl_discrete_lower_critic_update,
     ppo_style_higher_actor_update,
 
     batch_skill_generator_update,
     batch_lowlevel_policy_update,
+    batch_lowlevel_policy_update_wobn,
+    batch_skill_generator_update_wobn,
 
     ra_hrl_skill_prior_regularized_actor_update,
     ra_hrl_skill_prior_regularized_critic_update,
@@ -600,8 +604,7 @@ def hrl_lower_policy_update(
     else:
         log_alpha_infos = {"lower_log_alpha": log_alpha, "lower_alpha_loss": 0.0}
 
-    if target_update_cond:
-        critic_target = polyak_update(critic, critic_target, tau)
+    critic_target = polyak_update(critic, critic_target, tau)
 
     new_models = {
         "lower_actor": new_actor,
@@ -687,11 +690,7 @@ def ra_hrl_higher_policy_update(
         dones=dones,
         gamma=gamma
     )
-
-    if target_update_cond:
-        new_critic_target = polyak_update(critic, critic_target, tau)
-    else:
-        new_critic_target = critic_target
+    new_critic_target = polyak_update(critic, critic_target, tau)
 
     new_models = {
         "higher_actor": new_actor,
@@ -727,3 +726,185 @@ def hrl_higher_policy_onpolicy_update(
     )
 
     return rng, {"higher_actor": new_higher_actor}, infos
+
+
+@functools.partial(jax.jit, static_argnames=("gamma", "target_update_cond"))
+def discrete_hrl_lower_policy_update(
+    rng: jnp.ndarray,
+
+    critic: Model,
+    critic_target: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    rewards: jnp.ndarray,
+    next_observations: jnp.ndarray,
+    dones: jnp.ndarray,
+    conditions: jnp.ndarray,
+    next_conditions: jnp.ndarray,
+
+    target_update_cond: bool,
+    gamma: float,
+):
+    """DQN"""
+    rng, _ = jax.random.split(rng)
+    new_critic, critic_infos = hrl_discrete_lower_critic_update(
+        rng=rng,
+        critic=critic,
+        critic_target=critic_target,
+
+        observations=observations,
+        actions=actions,
+        rewards=rewards,
+        next_observations=next_observations,
+        dones=dones,
+        conditions=conditions,
+        next_conditions=next_conditions,
+
+        gamma=gamma
+    )
+    if target_update_cond:
+        new_critic_target = polyak_update(new_critic, critic_target, tau=1.0)
+    else:
+        new_critic_target = critic_target
+
+    new_models = {"critic": new_critic, "critic_target": new_critic_target}
+    return rng, new_models, critic_infos
+
+
+@jax.jit
+def skill_prior_update_wobn(
+    rng: jnp.ndarray,
+
+    lowlevel_policy: Model,      # Output: pseudo-action
+    skill_generator: Model,
+    skill_prior: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,       # NOTE: This is pseudo-action. Original dataset doesn't containing actions
+    last_observations: jnp.ndarray,
+
+):
+    """
+    >> observations, next_observations: [batch_size, subseq_len, obs_dim * n_frames]
+    >> last_observations: [batch_size, obs_dim * n_frames]
+    >> actions: [batch_size, subseq_len, action_dim]     # In this code, action_dim = obs_dim
+    NOTE:
+        actions: This has a shape [batch_size, subseq_len, pseudo_action_dim]
+        Lowlevel policy is trained by behavior cloning the 'next action'.
+        So actions must be sliced into the size of [batch_size, 'subseq_len-1', pseudo_action_dim]
+        and the last action is a target of behavior cloning.
+    """
+    rng, _ = jax.random.split(rng)
+    new_skill_generator, lowlevel_policy_2, skill_generator_infos = batch_skill_generator_update_wobn(
+        rng=rng,
+        lowlevel_policy=lowlevel_policy,
+        skill_generator=skill_generator,
+        observations=observations,
+        actions=actions,
+        last_observations=last_observations
+    )
+
+    rng, _ = jax.random.split(rng)
+    new_lowlevel_policy, lowlevel_policy_infos = batch_lowlevel_policy_update_wobn(
+        rng=rng,
+        lowlevel_policy=lowlevel_policy_2,
+        skill_generator=skill_generator,
+
+        observations=observations,
+        actions=actions,
+        last_observations=last_observations
+    )
+
+    rng, _ = jax.random.split(rng)
+    new_skill_prior, skill_prior_infos = learned_skill_prior_update_wobn(
+        rng=rng,
+        skill_generator=skill_generator,
+        skill_prior=skill_prior,
+        observations=observations,
+        actions=actions,
+        last_observations=last_observations,
+    )
+
+    new_models = {
+        "skill_generator": new_skill_generator,
+        "lowlevel_policy": new_lowlevel_policy,
+        "skill_prior": new_skill_prior
+    }
+    infos = defaultdict(int)
+    infos.update({**skill_generator_infos, **lowlevel_policy_infos, **skill_prior_infos})
+
+    return rng, new_models, infos
+
+
+def ra_hrl_higher_policy_update_wobn(
+    rng: jnp.ndarray,
+
+    actor: Model,
+    critic: Model,
+    critic_target: Model,
+    log_alpha: Model,
+    skill_prior: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    rewards: jnp.ndarray,
+    next_observations: jnp.ndarray,
+    dones: jnp.ndarray,
+
+    gamma: float,
+    target_alpha: float,
+    tau: float,
+    target_update_cond: bool,
+    alpha_update: bool
+):
+    if alpha_update:
+        rng, _ = jax.random.split(rng)
+        new_log_alpha, log_alpha_infos = ra_hrl_higher_log_alpha_update(
+            rng=rng,
+            skill_prior=skill_prior,
+            log_alpha=log_alpha,
+            actor=actor,
+            observations=observations,
+            target_alpha=target_alpha,
+        )
+    else:
+        new_log_alpha = log_alpha
+        log_alpha_infos = {"higher_log_alpha": log_alpha, "higher_alpha_loss": 0.0}
+
+    rng, _ = jax.random.split(rng)
+    new_actor, actor_infos = ra_hrl_skill_prior_regularized_actor_update(
+        rng=rng,
+        skill_prior=skill_prior,
+        actor=actor,
+        critic=critic,
+        log_alpha=log_alpha,
+        observations=observations
+    )
+
+    rng, _ = jax.random.split(rng)
+    new_critic, critic_infos = ra_hrl_skill_prior_regularized_critic_update(
+        rng=rng,
+        skill_prior=skill_prior,
+        actor=actor,
+        critic=critic,
+        critic_target=critic_target,
+        log_alpha=log_alpha,
+
+        observations=observations,
+        actions=actions,
+        next_observations=next_observations,
+        rewards=rewards,
+        dones=dones,
+        gamma=gamma
+    )
+    new_critic_target = polyak_update(critic, critic_target, tau)
+
+    new_models = {
+        "higher_actor": new_actor,
+        "higher_critic": new_critic,
+        "higher_critic_target": new_critic_target,
+        "higher_log_alpha": new_log_alpha
+    }
+    infos = {**actor_infos, **critic_infos, **log_alpha_infos}
+    return rng, new_models, infos

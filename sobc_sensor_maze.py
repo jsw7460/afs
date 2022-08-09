@@ -38,7 +38,6 @@ if __name__ == '__main__':
                 self.model.learn(bc_timesteps, log_interval=1)
 
         def get_model(self):
-
             # Set model
             model = hydra.utils.instantiate(
                 self.cfg.sopt_model,

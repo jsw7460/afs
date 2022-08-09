@@ -14,7 +14,7 @@ from sopt.utils import (
 PRETTY_PRINTER = pprint.PrettyPrinter(width=41, compact=True)
 
 
-@hydra.main(config_path="./sopt/conf", config_name="hrl_ra_kitchen")
+@hydra.main(config_path="./sopt/conf", config_name="hrl_ra_kitchen_wobn")
 def main(cfg: DictConfig) -> None:
     pp_cfg = OmegaConf.to_container(cfg, resolve=True)
     PRETTY_PRINTER.pprint(pp_cfg)
@@ -24,8 +24,7 @@ def main(cfg: DictConfig) -> None:
 if __name__ == '__main__':
 
     class SoptRLWorkSpace(object):
-
-        TAG = "hrl_ra_kitchen"
+        TAG = "hrl_train_kitchen_1M"
 
         def __init__(self, cfg: DictConfig):
             self.cfg = cfg
@@ -42,8 +41,8 @@ if __name__ == '__main__':
             eval_env = gym.wrappers.FlattenObservation(eval_env)
             callback = EvalCallback(
                 eval_env=eval_env,
-                n_eval_episodes=5,
-                eval_freq=50000,
+                n_eval_episodes=1,
+                eval_freq=10000,
                 log_path=f"/workspace/callback_results/{self.TAG}",
                 best_model_save_path=None,
                 deterministic=True,
@@ -57,7 +56,6 @@ if __name__ == '__main__':
                 self.model.learn(
                     rl_total_timesteps,
                     log_interval=1,
-                    reset_num_timesteps=False,
                     tb_log_name=f"{self.TAG}",
                     callback=callback
                 )
@@ -72,18 +70,8 @@ if __name__ == '__main__':
                 self.cfg.sopt_model,
                 env=self.env,
                 policy=SkillBasedComposedPolicy,
-                replay_buffer_class=replay_buffer_class,
-                train_freq=self.cfg.subseq_len      # Update for every subseq_len step
+                replay_buffer_class=replay_buffer_class
             )
-
-            # Set expert state buffer
-            if self.cfg["skill_prior_build"]:
-                model.set_expert_buffer(
-                    self.cfg.expert_buffer_path,
-                    self.cfg.n_frames,
-                    self.cfg.subseq_len,
-                    max_traj_len=self.cfg.max_expert_traj_len,
-                )
 
             # Build rl components
             rl_total_timesteps = model.build_hrl_models(OmegaConf.to_container(self.cfg.hrl_config, resolve=True))

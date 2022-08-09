@@ -156,7 +156,7 @@ class SOPTSkillEmpowered(OffPolicyAlgorithm):
             create_eval_env=create_eval_env,
             seed=seed,
             optimize_memory_usage=optimize_memory_usage,
-            supported_action_spaces=(gym.spaces.Box),
+            supported_action_spaces=(gym.spaces.Box, gym.spaces.Discrete),
             support_multi_env=True,
             without_exploration=without_exploration,
             dropout=dropout
@@ -220,7 +220,7 @@ class SOPTSkillEmpowered(OffPolicyAlgorithm):
 
     @property
     def skill_prior_model_save_interval(self):
-        return 100_000
+        return 500_000
 
     @property
     def skill_generator_class(self):
@@ -276,6 +276,8 @@ class SOPTSkillEmpowered(OffPolicyAlgorithm):
         self.expert_buffer_class = buffer_class
         self.expert_dataset_dir = path
         self.expert_dataset_list = sorted([f for f in os.listdir(path)])
+
+        print("Expert dataset list:", self.expert_dataset_list)
 
         current_dataset_path = path + self.expert_dataset_list[self.current_dataset_pos]
         self.expert_buffer = buffer_class(
@@ -424,7 +426,8 @@ class SOPTSkillEmpowered(OffPolicyAlgorithm):
             "skill_dim": self.skill_dim,
             "dropout": self.dropout,
             "net_arch": self.model_archs["skill_prior"],
-            "log_std_coef": self.sp_logstd_coef
+            "log_std_coef": self.sp_logstd_coef,
+            "relu_slope": self.relu_slope
         }
         skill_prior_def = self.skill_prior_class(**skill_prior_kwargs)
 

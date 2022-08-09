@@ -13,7 +13,7 @@ from sopt.utils import (
 PRETTY_PRINTER = pprint.PrettyPrinter(width=41, compact=True)
 
 
-@hydra.main(config_path="./sopt/conf", config_name="sp_ra_kitchen")
+@hydra.main(config_path="./sopt/conf", config_name="sp_ra_kitchen_wobn")
 def main(cfg: DictConfig) -> None:
     pp_cfg = OmegaConf.to_container(cfg, resolve=True)
     PRETTY_PRINTER.pprint(pp_cfg)
@@ -36,7 +36,12 @@ if __name__ == '__main__':
 
             with self.model.skill_prior_learning_phase():
                 with self.model.use_real_action_sequence():
-                    self.model.learn(skill_prior_total_timesteps, log_interval=1, tb_log_name="RASkillPriorTraining")
+                    with self.model.not_apply_bn():
+                        self.model.learn(
+                            skill_prior_total_timesteps,
+                            log_interval=1,
+                            tb_log_name="RASkillPriorTrainingWobn"
+                        )
 
         def get_model(self):
             # Set model. To use real action sequence, pseudo action dim is explicitely given.

@@ -649,29 +649,24 @@ class MLPSkillPrior(nn.Module):
             activation_fn=LeakyReLu(self.relu_slope),
             dropout=self.dropout,
             batchnorm=True,
-            layernorm=True,
             kernel_init=nn.initializers.xavier_normal()
         )
-
         self.mu = create_mlp(
             output_dim=self.skill_dim,
-            net_arch=[128] * 1,
+            net_arch=[128],
             activation_fn=LeakyReLu(self.relu_slope),
             dropout=self.dropout,
             squash_output=False,
             batchnorm=True,
-            layernorm=True,
             kernel_init=nn.initializers.xavier_normal()
         )
-
         self.log_std = create_mlp(
             output_dim=self.skill_dim,
-            net_arch=[128] * 1,
+            net_arch=[128],
             activation_fn=LeakyReLu(self.relu_slope),
             dropout=self.dropout,
             squash_output=False,
             batchnorm=True,
-            layernorm=True,
             kernel_init=nn.initializers.xavier_normal()
         )
 
@@ -696,6 +691,47 @@ class MLPSkillPrior(nn.Module):
         return dist
 
 
+class EnsembleMLPSkillPrior(nn.Module):
+    features_extractor: BaseFeaturesExtractor
+    observation_space: gym.Space
+
+    latent_dim: int  # Output dim of hidden layer
+    skill_dim: int
+    log_std_coef: float = 2.0
+    dropout: float = 0.0
+    net_arch: List = None
+    relu_slope: float = 0.2
+    n_skill_prior: int = 3
+
+    skill_priors = None
+
+    def setup(self) -> None:
+        batch_priors = nn.vmap(
+            MLPSkillPrior,
+            in_axes=None,
+            out_axes=1,
+            variable_axes={"params":1, "batch_stats": 1},
+            split_rngs={"params": True, "dropout": True},
+            axis_size=self.n_skill_prior
+        )
+        self.skill_priors = batch_priors(
+            self.features_extractor,
+            self.observation_space,
+            self.latent_dim,
+            self.skill_dim,
+            self.log_std_coef,
+            self.dropout,
+            self.net_arch,
+            self.relu_slope
+        )
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(self, observations: jnp.ndarray, deterministic: bool = False, **kwargs):
+        return self.skill_priors(observations, deterministic, **kwargs)
+
+
 class SquashedMLPSkillPrior(nn.Module):
     """
     Approximate the skill generator by inputting the current state
@@ -710,6 +746,7 @@ class SquashedMLPSkillPrior(nn.Module):
     log_std_coef: float = 2.0
     dropout: float = 0.0
     net_arch: List = None
+    relu_slope: float = 0.2
 
     latent_pi = None
     mu = None
@@ -720,7 +757,8 @@ class SquashedMLPSkillPrior(nn.Module):
         self.latent_pi = create_mlp(
             output_dim=self.latent_dim,
             net_arch=net_arch,
-            activation_fn=LeakyReLu(0.2),
+            activation_fn=LeakyReLu(self.relu_slope),
+            # activation_fn=LeakyReLu(0.2),
             dropout=self.dropout,
             batchnorm=True,
             kernel_init=nn.initializers.xavier_normal()
@@ -729,7 +767,8 @@ class SquashedMLPSkillPrior(nn.Module):
         self.mu = create_mlp(
             output_dim=self.skill_dim,
             net_arch=[128] * 1,
-            activation_fn=LeakyReLu(0.2),
+            activation_fn=LeakyReLu(self.relu_slope),
+            # activation_fn=LeakyReLu(0.2),
             dropout=self.dropout,
             squash_output=False,
             batchnorm=True,
@@ -739,7 +778,8 @@ class SquashedMLPSkillPrior(nn.Module):
         self.log_std = create_mlp(
             output_dim=self.skill_dim,
             net_arch=[128] * 1,
-            activation_fn=LeakyReLu(0.2),
+            activation_fn=LeakyReLu(self.relu_slope),
+            # activation_fn=LeakyReLu(0.2),
             dropout=self.dropout,
             squash_output=False,
             batchnorm=True,
@@ -1054,6 +1094,5 @@ class ImgVariationalAutoEncoder(nn.Module):
     def get_latent_vector(self, mu: np.ndarray, log_std: np.ndarray) -> np.ndarray:
         rng = self.make_rng("latent_sampling")
         std = jnp.exp(log_std)
-        # latent = mu + std * jax.random.standard_normal(std.shape)
         latent = mu + std * jax.random.normal(rng, shape=mu.shape)
         return latent

@@ -649,7 +649,7 @@ class MazeExpertBuffer(SoptFiSensorBasedExpertBuffer):
         qpos = trajectory["observations"][-1][:2]
         # pos_condition = qpos[0] >= 16.0 and qpos[1] >= 16.0       # For size 20
         # pos_condition = qpos[0] >= 16.0 and qpos[1] >= 16.0
-        pos_condition = qpos[0] <= 2.00 and qpos[1] >= 9.00
+        pos_condition = qpos[0] <= 1.70 and qpos[1] >= 9.30         # For LargeMaze layout
         return len_condition or pos_condition
 
 
@@ -918,7 +918,7 @@ class HigherReplayBuffer(BaseBuffer):
         self.subseq_len = subseq_len
 
         # Adjust buffer size
-        self.buffer_size = max(buffer_size // (n_envs * subseq_len), 1)
+        self.buffer_size = max(buffer_size // n_envs, 1)
 
         # Check that the replay buffer can fit into the memory
         if psutil is not None:
@@ -941,7 +941,12 @@ class HigherReplayBuffer(BaseBuffer):
         self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=higher_action_space.dtype)
 
         # Higher replay buffer saves the 'trajectory' of lower actions
-        lower_action_dim = lower_action_space.shape[-1]
+        if isinstance(lower_action_space, gym.spaces.Box):
+            lower_action_dim = lower_action_space.shape[-1]
+        elif isinstance(lower_action_space, gym.spaces.Discrete):
+            lower_action_dim = 1
+        else:
+            raise NotImplementedError()
         self.lower_actions = np.zeros((self.buffer_size, self.n_envs, self.subseq_len, lower_action_dim), dtype=lower_action_space.dtype)
 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)

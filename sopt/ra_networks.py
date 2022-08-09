@@ -1,5 +1,3 @@
-# sprep: Skill Prior REProducing networks.
-
 from typing import Callable
 from typing import Tuple, List, Any
 
@@ -125,8 +123,7 @@ class LSTMSubTrajectoryBasedSkillGenerator(nn.Module):
             lstm_input = self.embed(features)
             carry, output = self.lstmcell(carry, lstm_input)
 
-        mu = self.mu(output, deterministic=deterministic, **kwargs)
-
+        mu = self.mu(output, deterministic=deterministic)
         mu, log_stds = jnp.array_split(mu, 2, axis=-1)
         log_stds = jnp.clip(log_stds, LOG_STD_MIN, LOG_STD_MAX)
 
@@ -337,7 +334,7 @@ class RALowLevelSkillPolicy(nn.Module):
         latent_pi = self.latent_pi(features, deterministic=deterministic, **kwargs)
 
         mean_actions = self.mu(latent_pi, deterministic=deterministic, **kwargs)
-        return mean_actions, jnp.zeros_like(mean_actions)
+        return mean_actions, jnp.zeros_like(mean_actions)           # Deterministic. Use only mean.
 
     def actions_from_params(self, mean: jnp.ndarray, log_std: jnp.ndarray):
         base_dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))

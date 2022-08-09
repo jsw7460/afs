@@ -13,7 +13,7 @@ from sopt.utils import (
 PRETTY_PRINTER = pprint.PrettyPrinter(width=41, compact=True)
 
 
-@hydra.main(config_path="./sopt/conf", config_name="sp_ra_kitchen")
+@hydra.main(config_path="./sopt/conf", config_name="sp_dropout_kitchen")
 def main(cfg: DictConfig) -> None:
     pp_cfg = OmegaConf.to_container(cfg, resolve=True)
     PRETTY_PRINTER.pprint(pp_cfg)
@@ -35,17 +35,14 @@ if __name__ == '__main__':
             self.model, skill_prior_total_timesteps = self.get_model()
 
             with self.model.skill_prior_learning_phase():
-                with self.model.use_real_action_sequence():
-                    self.model.learn(skill_prior_total_timesteps, log_interval=1, tb_log_name="RASkillPriorTraining")
+                self.model.learn(skill_prior_total_timesteps, log_interval=1, tb_log_name="skill_prior_kitchen")
 
         def get_model(self):
-            # Set model. To use real action sequence, pseudo action dim is explicitely given.
-            pseudo_action_dim = self.env.action_space.shape[-1]
+            # Set model
             model = hydra.utils.instantiate(
                 self.cfg.sopt_model,
                 env=self.env,
                 policy=SkillBasedComposedPolicy,
-                pseudo_action_dim=pseudo_action_dim
             )
 
             # Set expert state buffer

@@ -1,7 +1,7 @@
 from .sopt_skill_prior import SOPTSkillEmpowered
 from .ra_skill_prior import RASkillPrior
 
-from .sopt_skill_prior_hrl import SkillBasedHRLAgent
+from .sopt_skill_prior_hrl import SkillBasedHRLAgent, DiscreteSkillBasedHRLAgent
 from .onpolicy_hrl import OnpolicySkillBasedHRLAgent
 from .ra_hrl import RASkillBasedHRLAgent
 

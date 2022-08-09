@@ -1,3 +1,4 @@
+# This is for reproduce the skill prior meta RL paper. Use real action sequence, not a pseudo action.
 import pprint
 
 import gym
@@ -13,7 +14,7 @@ from sopt.utils import (
 PRETTY_PRINTER = pprint.PrettyPrinter(width=41, compact=True)
 
 
-@hydra.main(config_path="./sopt/conf", config_name="sp_ra_kitchen")
+@hydra.main(config_path="./sopt/conf", config_name="sp_ra_kitchen_wobn")
 def main(cfg: DictConfig) -> None:
     pp_cfg = OmegaConf.to_container(cfg, resolve=True)
     PRETTY_PRINTER.pprint(pp_cfg)

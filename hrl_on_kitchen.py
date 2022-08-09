@@ -7,7 +7,8 @@ from omegaconf import DictConfig, OmegaConf
 from sopt.policies import SkillBasedComposedPolicy
 from sopt.utils import (
     RewardMDPSensorObservationStackWrapper,
-    get_kitchen_env
+    get_kitchen_env,
+    EvalCallback
 )
 
 PRETTY_PRINTER = pprint.PrettyPrinter(width=41, compact=True)
@@ -23,6 +24,7 @@ def main(cfg: DictConfig) -> None:
 if __name__ == '__main__':
 
     class SoptRLWorkSpace(object):
+        TAG = "hrl_on_kitchen_2M"
 
         def __init__(self, cfg: DictConfig):
             self.cfg = cfg
@@ -34,9 +36,30 @@ if __name__ == '__main__':
             self.model = None
             self.model, rl_total_timesteps = self.get_model()
 
+            eval_env = get_kitchen_env(self.cfg.kitchen_env)
+            eval_env = RewardMDPSensorObservationStackWrapper(eval_env, n_frames=cfg.n_frames, max_len=cfg.env_max_len)
+            eval_env = gym.wrappers.FlattenObservation(eval_env)
+            callback = EvalCallback(
+                eval_env=eval_env,
+                n_eval_episodes=1,
+                eval_freq=10000,
+                log_path=f"/workspace/callback_results/{self.TAG}",
+                best_model_save_path=None,
+                deterministic=True,
+                render=False,
+                verbose=1,
+                warn=True
+            )
+
             with self.model.hrl_phase():
                 print(f"Hrl phase, {rl_total_timesteps}\n" * 30)
-                self.model.learn(rl_total_timesteps, log_interval=1, reset_num_timesteps=False)
+                self.model.learn(
+                    rl_total_timesteps,
+                    log_interval=1,
+                    reset_num_timesteps=False,
+                    tb_log_name=f"{self.TAG}",
+                    callback=callback
+                )
 
         def get_model(self):
             # Set model

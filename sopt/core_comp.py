@@ -1,6 +1,6 @@
 from functools import partial
 from typing import Dict, Tuple, Union
-
+import optax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -743,6 +743,7 @@ def learned_skill_prior_update(
         {"params": skill_prior.params, "batch_stats": skill_prior.batch_stats},
         observations[:, 0, ...],
         deterministic=False,
+        rngs={"dropout": z_dropout_key},
         training=False
     )
     prior_z = prior_z_dist.sample(seed=prior_sampling)
@@ -874,25 +875,33 @@ def hrl_skill_prior_regularized_actor_update(
     rng, forwarding_key, dropout_key, prior_sampling = jax.random.split(rng, 4)
 
     # Training = False for skill prior, e.g., running mean = True for batch normalization
+
     prior_z_dist, prior_mu, prior_log_std = skill_prior.apply_fn(
         {"params": skill_prior.params, "batch_stats": skill_prior.batch_stats},
         observations,
+        rngs={"dropout": dropout_key},
         deterministic=True,
         training=False
     )
     prior_z = prior_z_dist.sample(seed=prior_sampling)
     self_ll = prior_z_dist.log_prob(prior_z)[:, jnp.newaxis]
 
+    skill_prior_dist = tfd.MultivariateNormalDiag(loc=prior_mu, scale_diag=jnp.exp(prior_log_std))
+
     def actor_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
-        action_dist, *_ = actor.apply_fn(
+        action_dist, actor_mu, actor_log_std = actor.apply_fn(
             {"params": params, "batch_stats": actor.batch_stats},
             observations,
+            rngs={"dropout": dropout_key},
             deterministic=True,
             training=False
         )
         actions_pi = action_dist.sample(seed=prior_sampling)
 
-        prior_divergence = tfd.kl_divergence(action_dist, prior_z_dist, allow_nan_stats=False)[:, jnp.newaxis]
+        actor_dist = tfd.MultivariateNormalDiag(loc=actor_mu, scale_diag=jnp.exp(actor_log_std))
+        prior_divergence = tfd.kl_divergence(actor_dist, skill_prior_dist, allow_nan_stats=False).reshape(-1, 1)
+        # Clip the divergence for stability
+        prior_divergence = jnp.clip((jnp.array(prior_divergence)), -100.0, 100.0)
 
         q_values_pi = critic.apply_fn(
             {"params": critic.params},
@@ -903,22 +912,16 @@ def hrl_skill_prior_regularized_actor_update(
         min_qf_pi = jnp.min(q_values_pi, axis=1)
         actor_loss = ((alpha * prior_divergence) - min_qf_pi).mean()
 
-        higher_self_ll = action_dist.log_prob(actions_pi)
         _infos = {
             "higher_actor_loss": actor_loss.mean(),
-            "higher_self_ll": higher_self_ll.mean(),
             "prior_divergence": prior_divergence.mean(),
             "prior_self_ll": self_ll.mean(),
-
-            "_prior_mean": prior_z_dist.mean(),
-            "_prior_var": prior_z_dist.stddev(),
-
-            "_actor_mean": action_dist.mean(),
-            "_actor_var": action_dist.stddev()
+            "mu_ratio": jnp.max(prior_mu / actor_mu),
+            "log_std_ratio": jnp.max(prior_log_std / actor_log_std)
         }
         return actor_loss, _infos
-    actor, infos = actor.apply_gradient(actor_loss_fn)
-    return actor, infos
+    new_actor, infos = actor.apply_gradient(actor_loss_fn)
+    return new_actor, infos
 
 
 def hrl_lower_actor_update(         # This is runned by SAC, hence use an entropy.
@@ -955,6 +958,7 @@ def hrl_lower_actor_update(         # This is runned by SAC, hence use an entrop
         )
         min_qf_pi = jnp.min(q_values_pi, axis=1)
         actor_loss = (alpha * log_prob - min_qf_pi).mean()
+
         return actor_loss, {'lower_actor_loss': actor_loss, 'entropy': -log_prob.mean()}
 
     new_actor, info = actor.apply_gradient(actor_loss_fn)
@@ -1065,20 +1069,25 @@ def hrl_skill_prior_regularized_critic_update(
     dropout_key, forwarding_key = jax.random.split(rng)
 
     alpha = jnp.exp(log_alpha())
-    next_action_dist, *_ = actor.apply_fn(
+    next_action_dist, actor_mu, actor_log_std = actor.apply_fn(
         {"params": actor.params, "batch_stats": actor.batch_stats},
         next_observations,
         deterministic=False,
         training=False,
         rngs={"dropout": dropout_key}
     )
-    next_prior_z_dist, *_ = skill_prior.apply_fn(
+    next_prior_z_dist, skill_prior_mu, skill_prior_log_std = skill_prior.apply_fn(
         {"params": skill_prior.params, "batch_stats": skill_prior.batch_stats},
         next_observations,
-        deterministic=False,
+        rngs={"dropout": dropout_key},
+        deterministic=True,
         training=False
     )
-    _prior_divergence =  tfd.kl_divergence(next_action_dist, next_prior_z_dist, allow_nan_stats=False)[:, jnp.newaxis]
+
+    actor_dist = tfd.MultivariateNormalDiag(loc=actor_mu, scale_diag=jnp.exp(actor_log_std))
+    prior_dist = tfd.MultivariateNormalDiag(loc=skill_prior_mu, scale_diag=jnp.exp(skill_prior_log_std))
+    _prior_divergence = tfd.kl_divergence(actor_dist, prior_dist).reshape(-1, 1)
+    _prior_divergence = jnp.clip((jnp.array(_prior_divergence)), -100.0, 100.0)
 
     next_actions = next_action_dist.sample(seed=rng)
 
@@ -1113,8 +1122,8 @@ def hrl_skill_prior_regularized_critic_update(
 
         return critic_loss, _infos
 
-    critic, info = critic.apply_gradient(critic_loss_fn)
-    return critic, info
+    new_critic, info = critic.apply_gradient(critic_loss_fn)
+    return new_critic, info
 
 
 def hrl_lower_critic_update(
@@ -1153,6 +1162,7 @@ def hrl_lower_critic_update(
 
     # add entropy term
     next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+
     # td error + entropy term
     target_q_values = rewards + (1 - dones) * gamma * next_q_values
 
@@ -1238,21 +1248,26 @@ def hrl_higher_log_alpha_update(
     target_alpha: float,
 ):
     rng, dropout_key = jax.random.split(rng)
-    action_dist, *_ = actor.apply_fn(
+    action_dist, actor_mu, actor_log_std = actor.apply_fn(
         {"params": actor.params, "batch_stats": actor.batch_stats},
         observations,
         deterministic=False,
         rngs={"dropout": dropout_key},
         training=False
     )
-    skill_prior_dist, *_ = skill_prior.apply_fn(
+    skill_prior_dist, skill_prior_mu, skill_prior_log_std = skill_prior.apply_fn(
         {"params": skill_prior.params, "batch_stats": skill_prior.batch_stats},
         observations,
-        deterministic=False,
+        deterministic=True,
         rngs={"dropout": dropout_key},
         training=False
     )
-    prior_divergence = tfd.kl_divergence(action_dist, skill_prior_dist, allow_nan_stats=False)
+
+    actor_dist = tfd.MultivariateNormalDiag(loc=actor_mu, scale_diag=jnp.exp(actor_log_std))
+    skill_prior_dist = tfd.MultivariateNormalDiag(loc=skill_prior_mu, scale_diag=jnp.exp(skill_prior_log_std))
+
+    prior_divergence = tfd.kl_divergence(actor_dist, skill_prior_dist, allow_nan_stats=False)
+    prior_divergence = jnp.clip(jnp.array(prior_divergence), -100.0, 100.0)
 
     def alpha_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
         _log_alpha = log_alpha.apply_fn({'params': params})
@@ -1352,8 +1367,7 @@ def ra_hrl_skill_prior_regularized_actor_update(
         rngs={"dropout": dropout_key},
         training=False
     )
-    prior_z = prior_z_dist.sample(seed=prior_sampling)
-    self_ll = prior_z_dist.log_prob(prior_z)[:, jnp.newaxis]
+    prior_dist = tfd.MultivariateNormalDiag(loc=prior_mu, scale_diag=jnp.exp(prior_log_std))
 
     def actor_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
         action_dist, actor_mu, actor_log_std = actor.apply_fn(
@@ -1367,8 +1381,8 @@ def ra_hrl_skill_prior_regularized_actor_update(
 
         actor_dist = tfd.MultivariateNormalDiag(loc=actor_mu, scale_diag=jnp.exp(actor_log_std))
 
-        prior_divergence = tfd.kl_divergence(actor_dist, prior_z_dist, allow_nan_stats=False).reshape(-1, 1)
-        prior_divergence = jnp.clip(jnp.array(prior_divergence), -100.0, 100.0)
+        prior_divergence = tfd.kl_divergence(actor_dist, prior_dist, allow_nan_stats=False).reshape(-1, 1)
+        prior_divergence = jnp.clip(jnp.array(prior_divergence), -10.0, 10.0)
 
         q_values_pi = critic.apply_fn(
             {"params": critic.params},
@@ -1379,12 +1393,9 @@ def ra_hrl_skill_prior_regularized_actor_update(
         min_qf_pi = jnp.min(q_values_pi, axis=1)
         actor_loss = ((alpha * prior_divergence) - min_qf_pi).mean()
 
-        higher_self_ll = action_dist.log_prob(actions_pi)
         _infos = {
             "higher_actor_loss": actor_loss.mean(),
-            "higher_self_ll": higher_self_ll.mean(),
             "prior_divergence": prior_divergence.mean(),
-            "prior_self_ll": self_ll.mean()
         }
         return actor_loss, _infos
     new_actor, infos = actor.apply_gradient(actor_loss_fn)
@@ -1427,9 +1438,9 @@ def ra_hrl_skill_prior_regularized_critic_update(
     )
 
     next_actor_dist = tfd.MultivariateNormalDiag(loc=actor_mu, scale_diag=jnp.exp(actor_log_std))
-    prior_divergence = tfd.kl_divergence(next_actor_dist, next_prior_z_dist, allow_nan_stats=False).reshape(-1, 1)
-    # prior_divergence = tfd.kl_divergence(next_actor_dist, next_prior_z_dist, allow_nan_stats=False).reshape(-1, 1)
-    prior_divergence = jnp.clip((jnp.array(prior_divergence)), -100.0, 100.0)
+    next_prior_dist = tfd.MultivariateNormalDiag(loc=prior_z_mu, scale_diag=jnp.exp(prior_z_log_std))
+    prior_divergence = tfd.kl_divergence(next_actor_dist, next_prior_dist, allow_nan_stats=False).reshape(-1, 1)
+    prior_divergence = jnp.clip((jnp.array(prior_divergence)), -10.0, 10.0)
 
     next_actions = next_action_dist.sample(seed=rng)
 
@@ -1488,8 +1499,9 @@ def ra_hrl_higher_log_alpha_update(
     )
 
     actor_dist = tfd.MultivariateNormalDiag(loc=actor_mu, scale_diag=jnp.exp(actor_log_std))
-    prior_divergence = tfd.kl_divergence(actor_dist, prior_z_dist, allow_nan_stats=False)
-    prior_divergence = jnp.clip(jnp.array(prior_divergence), -100.0, 100.0)
+    prior_dist = tfd.MultivariateNormalDiag(loc=prior_mu, scale_diag=jnp.exp(prior_log_std))
+    prior_divergence = tfd.kl_divergence(actor_dist, prior_dist, allow_nan_stats=False)
+    prior_divergence = jnp.clip(jnp.array(prior_divergence), -10.0, 10.0)
 
     def alpha_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
         _log_alpha = log_alpha.apply_fn({'params': params})
@@ -1546,11 +1558,6 @@ def ppo_style_higher_actor_update(
         actor_loss = -jnp.min(actor_loss, axis=0).mean()
         # NOTE: PPO END
 
-        # # NOTE: If we want 'not' to maximize the ratio
-        # print("Returns shape", returns.shape)
-        # print("Actor log prob", actor_log_prob.shape)
-        # actor_loss = jnp.mean(returns * jnp.clip(actor_log_prob, -100, 50))
-
         # Logging
         clip_fraction = jnp.mean((jnp.abs(ratio - 1) > clip_range))
         _infos = {
@@ -1567,3 +1574,254 @@ def ppo_style_higher_actor_update(
 
     new_actor, infos = higher_actor.apply_gradient(higher_actor_loss_fn)
     return rng, new_actor, infos
+
+
+def hrl_discrete_lower_critic_update(
+    rng: jnp.ndarray,
+    critic: Model,
+    critic_target: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    rewards: jnp.ndarray,
+    next_observations: jnp.ndarray,
+    dones: jnp.ndarray,
+    conditions: jnp.ndarray,
+    next_conditions: jnp.ndarray,
+
+    gamma :float,
+):
+    rng, dropout_key = jax.random.split(rng)
+    next_q_values = critic_target.apply_fn(
+        {"params": critic_target.params},
+        next_observations,
+        next_conditions,
+        deterministic=False,
+        training=True,
+        rngs={"dropout": dropout_key}
+    )
+    next_q_values = jnp.max(next_q_values, axis=1).reshape(-1, 1)
+
+    target_q_values = rewards + (1 - dones) * gamma * next_q_values
+
+    def critic_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
+        current_q_values = critic.apply_fn(
+            {"params": params},
+            observations,
+            conditions,
+            deterministic=False,
+            training=False,
+            rngs={"dropout": dropout_key}
+        )
+        current_q_values = jnp.take_along_axis(current_q_values, actions, axis=1)
+        critic_loss = jnp.mean(optax.huber_loss(current_q_values, target_q_values))
+        _info = {"critic_loss": critic_loss}
+        return critic_loss, _info
+
+    new_critic, info = critic.apply_gradient(critic_loss_fn)
+    return new_critic, info
+
+
+def batch_skill_generator_update_wobn(
+    rng: jnp.ndarray,
+
+    lowlevel_policy: Model,
+    skill_generator: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    last_observations: jnp.ndarray,
+
+):
+    obs_dim = observations.shape[-1]
+    act_dim = actions.shape[-1]
+
+    rng, dropout_key, init_key, batch_key, skill_sampling_key = jax.random.split(rng, 5)
+    subseq_len = actions.shape[1]
+
+    # Skill generator is trained by accelerating the behavior cloning of primitive action policy
+    def skill_generator_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
+
+        z_dist, skill_mu, skill_log_std = skill_generator.apply_fn(
+            {"params": params},
+            observations,
+            actions,
+            last_observation=last_observations,
+            rngs={"dropout": dropout_key, "init": init_key},
+        )
+        skill_std = jnp.exp(skill_log_std)
+
+        # Compute kl-divergence loss (to N(0, 1))
+        kl_loss = (jnp.log(STD_DEV) - skill_log_std) \
+                  + skill_std ** 2 + (skill_mu - STD_MEAN) ** 2 \
+                  / (2 * STD_DEV ** 2) - 0.5
+        kl_loss = jnp.mean(kl_loss)
+
+        # Sample skill making latent vector z (reparameterize)
+        # z = skill_mu + skill_std * jax.random.normal(skill_sampling_key, shape=skill_mu.shape)
+
+        nongrad_z = z_dist.sample(seed=skill_sampling_key)
+
+        batch_observations = observations.reshape(-1, obs_dim)
+        batch_actions = actions.reshape(-1, act_dim)
+        batch_nongrad_z = jnp.repeat(nongrad_z, repeats=subseq_len, axis=0)
+
+        skill_generator_self_ll = z_dist.log_prob(nongrad_z)
+
+        # Compute bc loss
+        (dist, mean_actions, log_stds) = lowlevel_policy.apply_fn(
+            {"params": lowlevel_policy.params, "batch_stats": lowlevel_policy.batch_stats},
+            batch_observations,
+            batch_nongrad_z,
+            rngs={"dropout": dropout_key},
+            training=False,
+        )
+        nll_loss = jnp.mean((mean_actions - batch_actions) ** 2)
+
+        # log_prob = dist.log_prob(batch_actions)
+        # nll_loss = - jnp.mean(log_prob)
+
+        skill_generator_loss = 0.0005 * kl_loss + nll_loss
+        _infos = {
+            "skill_generator_loss": skill_generator_loss,
+            "skill_generator_kl_loss": kl_loss,
+            "skill_generator_nll_loss": nll_loss,
+            "z": nongrad_z,   # This will be conditioned on skill decoder(lowlevel policy) and training target of skill prior
+            "skill_mean": skill_mu.mean(),
+            "skill_log_std": skill_log_std.mean(),
+            "skill_generator_self_ll": skill_generator_self_ll.mean()
+        }
+        return skill_generator_loss, _infos
+
+    skill_generator, infos = skill_generator.apply_gradient(skill_generator_loss_fn)
+    return skill_generator, lowlevel_policy, infos
+
+
+def batch_lowlevel_policy_update_wobn(
+    rng: jnp.ndarray,
+
+    lowlevel_policy: Model,
+    skill_generator: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    last_observations: jnp.ndarray,
+
+):
+    subseq_len = actions.shape[1]
+
+    rng, z_dropout_key, z_init_key = jax.random.split(rng, 3)
+    z_dist, *_ = skill_generator.apply_fn(
+        {"params": skill_generator.params},
+        observations,
+        actions,
+        last_observation=last_observations,
+        rngs={"dropout": z_dropout_key, "init": z_init_key}
+    )
+    z = z_dist.sample(seed=rng)
+
+    # Do bc using pseudo actionsw
+    def lowlevel_policy_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
+        dropout_key, _ = jax.random.split(rng)
+
+        obs_dim = observations.shape[-1]
+        act_dim = actions.shape[-1]
+
+        batch_observations = observations.reshape(-1, obs_dim)
+        batch_actions = actions.reshape(-1, act_dim)
+        batch_z = jnp.repeat(z, repeats=subseq_len, axis=0)
+
+        dist, mean_actions, log_stds = lowlevel_policy.apply_fn(
+            {"params": params, "batch_stats": lowlevel_policy.batch_stats},
+            batch_observations,
+            batch_z,
+            rngs={"dropout": dropout_key},
+            training=False,
+        )
+
+        # log_prob = dist.log_prob(batch_actions)
+        # lowlevel_policy_loss = - jnp.mean(log_prob)
+
+        lowlevel_policy_loss = jnp.mean((mean_actions - batch_actions) ** 2)
+
+        # samples = dist.sample(seed=rng).reshape(-1, act_dim)
+        # lowlevel_policy_loss = jnp.mean((samples - batch_actions) ** 2)
+
+        test_sample = dist.sample(seed=rng)
+        lowlevel_self_ll = dist.log_prob(test_sample)
+
+        _info = {
+            "lowlevel_policy_loss": lowlevel_policy_loss,
+            "lowlevel_policy_mean": mean_actions.mean(),
+            "lowlevel_log_std": log_stds.mean(),
+            "lowlevel_self_ll": lowlevel_self_ll,
+            "lowlevel_sample": test_sample,
+            "pseudoaction_mean": mean_actions,
+            "pseudoaction_log_stds": log_stds,
+            "pseudoaction_sample": test_sample,
+        }
+        return lowlevel_policy_loss, _info
+
+    lowlevel_policy, infos = lowlevel_policy.apply_gradient(lowlevel_policy_loss_fn)
+    return lowlevel_policy, infos
+
+
+def learned_skill_prior_update_wobn(
+    rng: jnp.ndarray,
+
+    skill_generator: Model,
+    skill_prior: Model,
+
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    last_observations: jnp.ndarray,
+):
+    """Skill prior: approximate skill generator"""
+
+    rng, z_dropout_key, z_init_key = jax.random.split(rng, 3)
+    z_dist, *_ = skill_generator.apply_fn(
+        {"params": skill_generator.params},
+        observations,
+        actions,
+        last_observation=last_observations,
+        rngs={"dropout": z_dropout_key, "init": z_init_key}
+    )
+    z = z_dist.sample(seed=rng)
+
+    _, dropout_key, batch_key = jax.random.split(rng, 3)
+    _, prior_sampling = jax.random.split(rng)
+
+    # Training = False for skill prior, e.g., running mean = True for batch normalization
+    prior_z_dist, prior_mu, prior_log_std = skill_prior.apply_fn(
+        {"params": skill_prior.params, "batch_stats": skill_prior.batch_stats},
+        observations[:, 0, ...],
+        deterministic=False,
+        rngs={"dropout": z_dropout_key},
+        training=False
+    )
+    prior_z = prior_z_dist.sample(seed=prior_sampling)
+    prior_z_self_ll = prior_z_dist.log_prob(prior_z)
+
+    def skill_prior_loss_fn(params: Params) -> Tuple[jnp.ndarray, InfoDict]:
+        # NOTE: Observation = first timestep's observation of given trajectory
+        dist, mean, log_stds = skill_prior.apply_fn(
+            {"params": params, "batch_stats": skill_prior.batch_stats},
+            observations[:, 0, ...],
+            deterministic=False,
+            training=False,
+            rngs={"dropout": dropout_key},
+        )
+        skill_prior_loss = - jnp.mean(dist.log_prob(z))
+
+        _infos = {
+            "skill_prior_loss": skill_prior_loss,
+            "skill_prior_mean": mean.mean(),
+            "skill_prior_log_std": log_stds.mean(),
+            "testtt": dist.log_prob(z),
+            "skill_prior_self_ll": prior_z_self_ll,
+            "prior_log_std": prior_log_std
+        }
+        return skill_prior_loss, _infos
+
+    skill_prior, infos = skill_prior.apply_gradient(skill_prior_loss_fn)
+    return skill_prior, infos
